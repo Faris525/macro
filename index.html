@@ -178,9 +178,11 @@ textarea.input{min-height:96px;resize:vertical;line-height:1.4}
 .authhead{display:flex;flex-direction:column;align-items:center;gap:12px;text-align:center;margin-bottom:6px}
 .authword{width:min(54vw,210px);height:auto;color:var(--ink)}
 .authtag{margin:0;font-size:16px;color:var(--ink-2)}
-.seg{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px;padding:4px;background:var(--surface);border-radius:12px}
-.seg button{min-height:42px;border:0;border-radius:9px;background:transparent;color:var(--ink-3);font:inherit;font-size:15px;font-weight:600}
-.seg button[aria-selected="true"]{background:var(--surface-2);color:var(--ink)}
+.authseg{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px;padding:4px;background:var(--surface);border-radius:12px}
+.authseg button{min-height:42px;border:0;border-radius:9px;background:transparent;color:var(--ink-3);font:inherit;font-size:15px;font-weight:600}
+.authseg button[aria-selected="true"]{background:var(--surface-2);color:var(--ink)}
+.obacct{text-align:center;margin-top:4px}
+.obword{width:150px;height:auto;display:block;color:var(--ink)}
 .authnote{text-align:center;margin-top:2px}
 .authfoot{margin-top:auto;display:flex;flex-direction:column;align-items:center;gap:2px;padding:18px 0 4px;text-align:center}
 .brandword{height:19px;width:auto;display:block;color:var(--ink)}
@@ -958,7 +960,7 @@ function renderAuth() {
       ${LOGO_WORD("authword")}
       <p class="authtag">Count what you eat. Hit your macros.</p>
     </div>
-    <div class="seg" role="tablist" aria-label="Account">
+    <div class="authseg" role="tablist" aria-label="Account">
       <button type="button" role="tab" data-act="authmode" data-m="up" aria-selected="${up}">Create account</button>
       <button type="button" role="tab" data-act="authmode" data-m="in" aria-selected="${!up}">Sign in</button>
     </div>
@@ -2683,7 +2685,7 @@ function renderOnboarding() {
   const prog = `<div class="obprog">${STEPS.slice(1).map((_, i) => `<i class="${i < step ? "on" : ""}"></i>`).join("")}</div>`;
   const back = step > 0 ? `<button class="btn ghost" data-ob="back">Back</button>` : "";
   let body = "";
-  if (id === "welcome") body = `<div class="hero"><div class="word">MAC<span>RO</span></div></div>
+  if (id === "welcome") body = `<div class="hero">${LOGO_WORD("obword")}</div>
     <div class="obtitle">Eat for the body you're building.</div>
     <p class="sub">Two minutes of setup. Get calorie and macro targets for bulking, cutting or maintaining, or bring your own, and track against them.</p>
     <div class="field"><label for="obname">What should we call you? <span class="tiny">(optional)</span></label><input id="obname" class="input" value="${esc(d.name || "")}" autocomplete="given-name"></div>
@@ -2723,7 +2725,8 @@ function renderOnboarding() {
     <p class="sub">You can change any of this later under <b>You</b> without losing logs.</p>`;
   }
   const next = id === "result" ? `<button class="btn primary grow" data-ob="finish">Start tracking</button>` : `<button class="btn primary grow" data-ob="next">${id === "welcome" ? "Get started" : id === "known" ? "Continue" : "Next"}</button>`;
-  return `<div class="ob">${step > 0 ? prog : ""}${body}<div class="obfoot">${back}${next}</div></div>`;
+  const acct = S.mode === "cloud" && Cloud.user ? `<p class="tiny obacct">Signed in as ${esc(Cloud.user.email || "")} · <button class="linkbtn" type="button" data-ob="signout">Sign out</button></p>` : "";
+  return `<div class="ob">${step > 0 ? prog : ""}${body}<div class="obfoot">${back}${next}</div>${acct}</div>`;
 }
 function obProfile() {
   const d = S.ob.d;
@@ -2745,6 +2748,7 @@ function bindOnboarding() {
   $$("[data-ob]").forEach(b => b.onclick = async () => {
     const act = b.dataset.ob;
     if (act === "back") { ob.step--; obSave(); render(); window.scrollTo(0, 0); return; }
+    if (act === "signout") { b.disabled = true; await Cloud.signOut(); try { localStorage.removeItem("macro.ob"); } catch { } S.ob = null; location.hash = "today"; render(); toast("Signed out"); return; }
     if (act === "finish") {
       b.disabled = true; b.textContent = "Saving…";
       S.profile = obProfile(); await Store.saveProfile();
