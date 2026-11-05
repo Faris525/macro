@@ -1250,7 +1250,13 @@ ${AI_RULES}`;
 }
 function aiPromptPhoto(note, region) {
   return `You are the food-analysis engine of a macro-tracking app. The user is in ${region || "an unspecified country"}.
-The attached image is a photo of a meal, a restaurant/fast-food order, or a supermarket product / nutrition label the user is about to eat.${note ? `\nThe user adds: """${note}"""` : ""}
+The attached image is a photo of a meal, a restaurant/fast-food order, or a supermarket product / nutrition label the user is about to eat.${note ? `
+The user's note about THIS SAME meal: """${note}"""
+How to use the note:
+- The note describes the food in the photo. It is NOT extra food unless it clearly says so. If the note mentions a food you can see (e.g. "200 g chicken" and there is chicken in the photo), it is the same item: use the note's quantity, ingredient, brand or cooking details for that item. Never list the same food twice.
+- Only add an item that is not in the photo when the note clearly says it is extra or out of shot (e.g. "plus a Coke Zero", "also had", "not in the photo"), or names a food that is plainly not visible at all.
+- If the note says they ate only part ("half", "left the rice"), scale those items down.
+- The note overrides what you see when they conflict (e.g. "it's brown rice", "cooked in 1 tbsp oil", "no sauce").` : ""}
 Identify every food item. Look carefully for chain branding, packaging, or a nutrition table.
 ${AI_RULES}`;
 }
