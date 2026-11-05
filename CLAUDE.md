@@ -5,6 +5,7 @@ Mobile-first calorie and macro tracker, used by the owner on iPhone as a home-sc
 ## Structure
 - `index.html`: the whole app (HTML, CSS and vanilla JS in one file, no framework, no build step).
 - `manifest.webmanifest`, `icon-*.png`: home-screen install.
+- `brand/`: logo sources (`icon.svg`, `wordmark.svg`, `mark.svg`). The logo is "macro" in Bricolage Grotesque 800 (outlined, no font loading) where the m is a fork: a blue handle rises from the middle stem. The wordmark is inlined in `index.html` as `LOGO_WORD`; icons are rendered from `brand/icon.svg`.
 - `netlify.toml`: static hosting from the repo root; `index.html` is served with `no-cache` so updates reach phones.
 
 ## How the code is organised (inside index.html)
