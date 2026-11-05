@@ -2388,7 +2388,7 @@ function renderYou() {
       <div class="setrow"><span class="k grow">Saved to</span><span class="v">${S.mode === "cloud" ? `Your account · ${esc(Cloud.user?.email || "")}` : S.mode === "account" ? "Your Claude account (private to you)" : STANDALONE ? "This phone only" : "This browser only"}</span></div>
       ${S.mode === "cloud" ? row("signout", "Sign out", Cloud.hasDirty() ? `${Cloud.dirtyCount()} change${Cloud.dirtyCount() > 1 ? "s" : ""} not synced yet` : "") : STANDALONE && Cloud.available() ? row("signin", "Create account or sign in", "Sync to your account") : ""}
       ${STANDALONE ? `<button class="setrow" data-edit="backup"><span class="k">Back up data</span><span class="v">Save a file</span><span class="chev">${ICON.chev}</span></button>
-      <label class="setrow" for="restorein" style="cursor:pointer"><span class="k">Restore from backup</span><span class="v">Choose file</span><span class="chev">${ICON.chev}</span><input id="restorein" type="file" accept="application/json,.json" hidden></label>` : ""}
+      <label class="setrow" for="restorein" style="cursor:pointer"><span class="k">Add data from a backup</span><span class="v">Choose file</span><span class="chev">${ICON.chev}</span><input id="restorein" type="file" accept="application/json,.json" hidden></label>` : ""}
       ${STANDALONE ? row("ai", "AI analysis", apiKey() ? `On · key …${esc(apiKey().slice(-4))}` : "Off · add API key") : ""}
       ${row("region", "Region for brand menus", esc(p.region || regionGuess() || "Not set"))}
       ${row("real", "What's live vs simulated", "")}
@@ -2412,9 +2412,24 @@ async function restoreData(file) {
   try {
     const d = JSON.parse(await file.text());
     if (d.app !== "macro" || !d.profile || typeof d.days !== "object" || typeof d.weights !== "object") throw 0;
-    S.profile = d.profile; S.days = d.days; S.weights = d.weights;
+    // Merge, never replace: keep everything already here and add what the backup has.
+    const key = i => (i && i.id) || JSON.stringify(i);
+    const days = { ...S.days };
+    let addedItems = 0;
+    for (const [k, day] of Object.entries(d.days)) {
+      if (!day || !Array.isArray(day.items) || !day.items.length) continue;
+      const cur = days[k];
+      const have = new Set(((cur && cur.items) || []).map(key));
+      const extra = day.items.filter(i => !have.has(key(i)));
+      if (!extra.length) continue;
+      addedItems += extra.length;
+      days[k] = { ...(cur || {}), date: k, items: [...extra, ...((cur && cur.items) || [])] };
+    }
+    const newW = Object.keys(d.weights).filter(k => !(k in S.weights)).length;
+    S.days = days; S.weights = { ...d.weights, ...S.weights };
+    if (!S.profile) S.profile = d.profile;
     if (S.mode === "cloud") Cloud.markAll(); else Store.saveLocal();
-    render(); toast(`Restored ${Object.keys(d.days).length} days and ${Object.keys(d.weights).length} weigh-ins`);
+    render(); toast(`Added ${addedItems} food${addedItems === 1 ? "" : "s"} and ${newW} weigh-in${newW === 1 ? "" : "s"} from the backup`);
   } catch { toast("That file isn't a Macro backup."); }
 }
 function bindYou() {
