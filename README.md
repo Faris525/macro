@@ -18,13 +18,12 @@ It's a single static page: `index.html` plus the manifest and icons. No build st
 - **Deploy:** Netlify serves the repository root (see `netlify.toml`). Every push to `main` publishes.
 - **iPhone:** open the site in Safari → Share → Add to Home Screen. Set up the app from the home-screen icon, not Safari.
 
-## Where data lives today
+## Where data lives
 
-Everything is stored on the device (browser storage). Use You → Back up data to save a copy. Moving to a real database with sign-in (Supabase) is the next step.
+Sign in with email and password, and everything is saved to your account in Supabase (Postgres with row-level security, so each person only sees their own data). The app keeps a copy on the phone, so it opens instantly and works offline; changes sync when you're back online. Without an account, data stays on the phone only.
 
 ## Roadmap
 
-1. Supabase database and email sign-in, so data syncs across devices and survives reinstalls.
-2. Move the Anthropic API key to a server function, so it isn't stored on the phone.
-3. A restaurant nutrition database for exact chain figures.
-4. Push notifications for reminders.
+1. Move the Anthropic API key to a server function, so it isn't stored on the phone.
+2. A restaurant nutrition database for exact chain figures.
+3. Push notifications for reminders.

@@ -10,6 +10,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#0E1013">
 <link rel="manifest" href="manifest.webmanifest">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.3/dist/umd/supabase.js"></script>
 <link rel="apple-touch-icon" href="icon-180.png">
 <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
 <style>:root{padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}body{margin:0}img{max-width:100%}[hidden]{display:none!important}</style>
@@ -688,6 +689,23 @@ const Store = {
     }
     useApiIfConfigured();
     S.ai.checked = true;
+    if (STANDALONE) {
+      if (Cloud.available()) {
+        Cloud.client();
+        const sess = await Cloud.session();
+        if (sess) return Cloud.start(sess.user);
+        if (!lsGet("macro.nocloud")) { S.mode = "signin"; S.ready = true; render(); return; }
+      } else {
+        // The account library couldn't load (no connection): open the last account's copy saved on this phone.
+        const last = lsGet("macro.cloud.last"), cache = last && lsGet("macro.cloud." + last.id);
+        if (cache) {
+          Cloud.user = last; S.mode = "cloud"; Cloud.state = "offline";
+          S.profile = cache.profile || null; S.days = cache.days || {}; S.weights = cache.weights || {};
+          Cloud.dirty = cache.dirty || { p: 0, d: {}, w: {} }; Cloud.wSnap = cache.wSnap || { ...S.weights }; Cloud.seq = cache.seq || 0;
+          finishBoot(); return;
+        }
+      }
+    }
     let id = null;
     if (user) { try { id = await user.id(); } catch { } try { const can = await user.can("data.write"); if (can === false) id = null; } catch { } }
     if (db && id) { this.db = db; this.uid = id; S.mode = "account"; this.subscribe(); }
@@ -722,7 +740,7 @@ const Store = {
     const d = lsGet("macro.v1") || {};
     S.profile = d.profile || null; S.days = d.days || {}; S.weights = d.weights || {};
   },
-  saveLocal() { lsSet("macro.v1", { profile: S.profile, days: S.days, weights: S.weights }); },
+  saveLocal() { if (S.mode === "cloud") { Cloud.saveCache(); return; } lsSet("macro.v1", { profile: S.profile, days: S.days, weights: S.weights }); },
   enqueue(ref, fn) {
     const k = ref.path;
     this.q[k] = (this.q[k] || Promise.resolve()).then(fn).catch(e => {
@@ -736,11 +754,13 @@ const Store = {
   },
   saveProfile() {
     S.profile.updatedAt = Date.now();
+    if (S.mode === "cloud") { Cloud.markProfile(); return Promise.resolve(); }
     if (S.mode === "account") return this.enqueue(this.profileRef(), () => this.profileRef().set(clone(S.profile)));
     this.saveLocal(); return Promise.resolve();
   },
   saveDay(k) {
     const day = S.days[k];
+    if (S.mode === "cloud") { if (day && !day.items.length) delete S.days[k]; Cloud.markDay(k); return Promise.resolve(); }
     if (S.mode === "account") {
       const ref = this.daysCol().doc(k);
       return this.enqueue(ref, () => day && day.items.length ? ref.set(clone(day)) : ref.delete());
@@ -749,10 +769,16 @@ const Store = {
     this.saveLocal(); return Promise.resolve();
   },
   saveWeights() {
+    if (S.mode === "cloud") { Cloud.markWeights(); return Promise.resolve(); }
     if (S.mode === "account") return this.enqueue(this.weightsRef(), () => this.weightsRef().set({ entries: { ...S.weights }, unit: "kg" }));
     this.saveLocal(); return Promise.resolve();
   },
   async wipe() {
+    if (S.mode === "cloud") {
+      if (!(await Cloud.wipeRemote())) { toast("Couldn't reach your account, so nothing was deleted. Try again when you're online."); return false; }
+      S.profile = null; S.days = {}; S.weights = {}; try { localStorage.removeItem("macro.ob"); } catch { }
+      return true;
+    }
     if (S.mode === "account") {
       const dayKeys = Object.keys(S.days);
       for (const k of dayKeys) { try { await this.daysCol().doc(k).delete(); } catch { } }
@@ -761,9 +787,239 @@ const Store = {
     }
     try { localStorage.removeItem("macro.v1"); localStorage.removeItem("macro.ob"); } catch { }
     S.profile = null; S.days = {}; S.weights = {};
+    return true;
   },
 };
 const clone = o => JSON.parse(JSON.stringify(o ?? null));
+
+/* =========================================================
+   Cloud: Supabase account + sync (home-screen app only)
+   Offline-first: every change is saved on the phone at once (per-account cache),
+   marked "dirty", then pushed to the account. Unsent changes survive restarts.
+   Tables: profiles(data jsonb), days(date, items jsonb), weights(date, kg); row-level security per user.
+   ========================================================= */
+const SUPABASE_URL = "https://acfprojdjumrfmicbtsp.supabase.co";
+const SUPABASE_KEY = "sb_publishable_UWWB_GB2SLhnDJbts0ObrA_wtdzbseL"; // publishable: safe in the app, access is limited by row-level security
+const Cloud = {
+  sb: null, user: null, seq: 0, dirty: { p: 0, d: {}, w: {} }, wSnap: {}, flushing: false, timer: null, state: "ok", signingOut: false,
+  available() { return STANDALONE && !!(window.supabase && window.supabase.createClient); },
+  client() {
+    if (!this.sb && this.available()) {
+      this.sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, storageKey: "macro.auth" } });
+      this.sb.auth.onAuthStateChange((ev) => {
+        if (ev === "SIGNED_OUT" && S.mode === "cloud" && !this.signingOut) {
+          S.mode = "signin"; S.authMode = "in"; S.authMsg = "Your sign-in expired. Sign in again; anything not yet saved is kept on this phone.";
+          this.user = null; render();
+        }
+      });
+    }
+    return this.sb;
+  },
+  cacheKey() { return "macro.cloud." + this.user.id; },
+  saveCache() { if (this.user) lsSet(this.cacheKey(), { profile: S.profile, days: S.days, weights: S.weights, dirty: this.dirty, wSnap: this.wSnap, seq: this.seq, at: Date.now() }); },
+  async session() { const c = this.client(); if (!c) return null; try { const { data } = await c.auth.getSession(); return data?.session || null; } catch { return null; } },
+  hasDirty() { return !!this.dirty.p || Object.keys(this.dirty.d).length > 0 || Object.keys(this.dirty.w).length > 0; },
+  dirtyCount() { return (this.dirty.p ? 1 : 0) + Object.keys(this.dirty.d).length + Object.keys(this.dirty.w).length; },
+  async start(user) {
+    this.user = { id: user.id, email: user.email || "" }; lsSet("macro.cloud.last", this.user);
+    S.mode = "cloud"; S.authMsg = null; S.cloudError = false;
+    const cache = lsGet(this.cacheKey());
+    if (cache) {
+      S.profile = cache.profile || null; S.days = cache.days || {}; S.weights = cache.weights || {};
+      this.dirty = cache.dirty || { p: 0, d: {}, w: {} }; this.wSnap = cache.wSnap || { ...S.weights }; this.seq = cache.seq || 0;
+      finishBoot();
+    } else { S.profile = null; S.days = {}; S.weights = {}; this.dirty = { p: 0, d: {}, w: {} }; this.wSnap = {}; }
+    const ok = await this.pull();
+    if (!cache) {
+      if (!ok) S.cloudError = true; // never start from an empty profile when the account couldn't be read
+      else {
+        const legacy = lsGet("macro.v1");
+        if (!S.profile && legacy && legacy.profile && legacy.profile.onboarded) S.importOffer = { days: Object.keys(legacy.days || {}).length, weights: Object.keys(legacy.weights || {}).length };
+      }
+      finishBoot();
+    } else refresh();
+    this.flush();
+  },
+  async pull() {
+    const c = this.client(); if (!c || !this.user) return false;
+    try {
+      const [p, d, w] = await Promise.all([
+        c.from("profiles").select("data").limit(1),
+        c.from("days").select("date,items").order("date", { ascending: false }).limit(400),
+        c.from("weights").select("date,kg").order("date", { ascending: false }).limit(2000),
+      ]);
+      const err = p.error || d.error || w.error; if (err) throw err;
+      if (!this.dirty.p) S.profile = (p.data && p.data[0] && p.data[0].data) || null;
+      const days = {}; for (const r of d.data || []) days[r.date] = { date: r.date, items: Array.isArray(r.items) ? r.items : [] };
+      for (const k of Object.keys(this.dirty.d)) { if (S.days[k]) days[k] = S.days[k]; else delete days[k]; }
+      S.days = days;
+      const ws = {}; for (const r of w.data || []) ws[r.date] = Number(r.kg);
+      for (const [k, v] of Object.entries(this.dirty.w)) { if (v == null) delete ws[k]; else ws[k] = v; }
+      S.weights = ws; this.wSnap = { ...ws };
+      if (S.profile && !S.profile.routine) S.profile.routine = { ...DEFAULT_ROUTINE };
+      if (!this.hasDirty()) this.state = "ok";
+      this.saveCache(); updatePill(); return true;
+    } catch (e) { console.warn("Macro: couldn't read account", e); this.state = "offline"; updatePill(); return false; }
+  },
+  markProfile() { this.dirty.p = ++this.seq; this.changed(); },
+  markDay(k) { this.dirty.d[k] = ++this.seq; this.changed(); },
+  markWeights() {
+    for (const k of new Set([...Object.keys(this.wSnap), ...Object.keys(S.weights)])) if (this.wSnap[k] !== S.weights[k]) this.dirty.w[k] = S.weights[k] ?? null;
+    this.wSnap = { ...S.weights }; this.changed();
+  },
+  markAll() {
+    if (S.profile) this.dirty.p = ++this.seq;
+    for (const k of Object.keys(S.days)) this.dirty.d[k] = ++this.seq;
+    for (const k of Object.keys(S.weights)) this.dirty.w[k] = S.weights[k];
+    this.wSnap = { ...S.weights }; this.changed();
+  },
+  changed() { if (this.state !== "offline") this.state = "saving"; this.saveCache(); updatePill(); clearTimeout(this.timer); this.timer = setTimeout(() => this.flush(), 400); },
+  async flush() {
+    const c = this.client();
+    if (!c || !this.user || this.flushing) return;
+    if (!this.hasDirty()) { if (this.state === "saving") { this.state = "ok"; updatePill(); } return; }
+    this.flushing = true; const uid = this.user.id;
+    try {
+      if (this.dirty.p && S.profile) {
+        const tok = this.dirty.p; const { error } = await c.from("profiles").upsert({ user_id: uid, data: S.profile }); if (error) throw error;
+        if (this.dirty.p === tok) this.dirty.p = 0;
+      } else if (this.dirty.p) this.dirty.p = 0;
+      for (const k of Object.keys(this.dirty.d)) {
+        const tok = this.dirty.d[k], day = S.days[k];
+        const { error } = day && day.items && day.items.length
+          ? await c.from("days").upsert({ user_id: uid, date: k, items: day.items })
+          : await c.from("days").delete().eq("date", k);
+        if (error) throw error;
+        if (this.dirty.d[k] === tok) delete this.dirty.d[k];
+      }
+      const sent = { ...this.dirty.w }, ups = Object.keys(sent).filter(k => sent[k] != null), dels = Object.keys(sent).filter(k => sent[k] == null);
+      if (ups.length) { const { error } = await c.from("weights").upsert(ups.map(k => ({ user_id: uid, date: k, kg: sent[k] }))); if (error) throw error; }
+      if (dels.length) { const { error } = await c.from("weights").delete().in("date", dels); if (error) throw error; }
+      for (const k of Object.keys(sent)) if (this.dirty.w[k] === sent[k]) delete this.dirty.w[k];
+      this.state = this.hasDirty() ? "saving" : "ok";
+    } catch (e) {
+      console.warn("Macro: sync failed", e); this.state = "offline";
+    } finally {
+      this.flushing = false; this.saveCache(); updatePill();
+      if (this.hasDirty() && this.state !== "offline") setTimeout(() => this.flush(), 50);
+    }
+  },
+  async wipeRemote() {
+    const c = this.client(); if (!c || !this.user) return false;
+    const r = await Promise.all([c.from("days").delete().gte("date", "1900-01-01"), c.from("weights").delete().gte("date", "1900-01-01"), c.from("profiles").delete().eq("user_id", this.user.id)]);
+    if (r.some(x => x.error)) return false;
+    this.dirty = { p: 0, d: {}, w: {} }; this.wSnap = {}; try { localStorage.removeItem(this.cacheKey()); } catch { }
+    return true;
+  },
+  async signOut() {
+    const c = this.client(); this.signingOut = true;
+    try { if (c) await c.auth.signOut(); } catch { }
+    if (this.user) { try { localStorage.removeItem(this.cacheKey()); } catch { } }
+    this.user = null; this.dirty = { p: 0, d: {}, w: {} }; this.wSnap = {}; this.signingOut = false;
+    S.profile = null; S.days = {}; S.weights = {}; S.mode = "signin"; S.authMode = "in";
+  },
+};
+function pillHtml() {
+  if (S.mode === "cloud") {
+    if (Cloud.state === "offline") return `<span class="pill warn" id="syncpill" title="Changes are saved on this phone and will sync when you're back online"><span class="dot"></span>Not synced</span>`;
+    if (Cloud.state === "saving") return `<span class="pill" id="syncpill" title="Saving to your account"><span class="dot"></span>Saving…</span>`;
+    return `<span class="pill good" id="syncpill" title="Saved to your account"><span class="dot"></span>Synced</span>`;
+  }
+  if (S.mode === "account") return `<span class="pill good" id="syncpill" title="Saved to your Claude account"><span class="dot"></span>Synced</span>`;
+  return `<span class="pill warn" id="syncpill" title="Saved on this device only"><span class="dot"></span>This device</span>`;
+}
+function updatePill() { const el = document.getElementById("syncpill"); if (el) el.outerHTML = pillHtml(); }
+// Bring in changes from other devices and send anything waiting, whenever the app comes back to the front.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible" || S.mode !== "cloud" || !S.ready) return;
+  if (Cloud.hasDirty()) Cloud.flush(); else Cloud.pull().then(ok => { if (ok) refresh(); });
+});
+window.addEventListener("online", () => { if (S.mode === "cloud") { Cloud.state = Cloud.hasDirty() ? "saving" : "ok"; Cloud.flush(); } });
+setInterval(() => { if (S.mode === "cloud" && Cloud.hasDirty() && !Cloud.flushing) Cloud.flush(); }, 30000);
+
+/* ---------------- Sign-in screen ---------------- */
+function renderAuth() {
+  const up = (S.authMode || (lsGet("macro.cloud.last") ? "in" : "up")) === "up";
+  return `<div class="ob">
+    <div class="hero"><div class="word">MAC<span>RO</span></div></div>
+    <div class="obtitle">${up ? "Create your account" : "Sign in"}</div>
+    <p class="sub">Your meals, weigh-ins and targets are saved to your account, so nothing is lost if you change phones, and you can open Macro on any device.</p>
+    ${S.authMsg ? `<div class="banner info"><div>${esc(S.authMsg)}</div></div>` : ""}
+    <form id="authf" class="stack" novalidate>
+      <div class="field"><label for="aemail">Email</label><input id="aemail" name="email" type="email" class="input" autocomplete="email" autocapitalize="off" spellcheck="false" inputmode="email" value="${esc(S.authEmail || "")}"></div>
+      <div class="field"><label for="apw">Password</label><input id="apw" name="password" type="password" class="input" autocomplete="${up ? "new-password" : "current-password"}">${up ? `<span class="fhint">At least 8 characters.</span>` : ""}</div>
+      <div class="ferr" id="autherr" role="alert"></div>
+      <button class="btn primary block" type="submit" id="authgo">${up ? "Create account" : "Sign in"}</button>
+    </form>
+    <button class="linkbtn" data-act="authswitch" type="button" style="align-self:flex-start">${up ? "Already have an account? Sign in" : "New here? Create an account"}</button>
+    <div class="stack" style="gap:4px;margin-top:6px">
+      <button class="linkbtn" data-act="authskip" type="button" style="align-self:flex-start;color:var(--ink-3)">Continue without an account</button>
+      <span class="tiny">Without an account, everything stays on this phone only.</span>
+    </div>
+  </div>`;
+}
+function authErrorText(e) {
+  const code = e && (e.code || e.error_code), msg = String((e && e.message) || "").toLowerCase();
+  if (e && (e.name === "AuthRetryableFetchError" || msg.includes("failed to fetch") || msg.includes("network"))) return "No connection. Check your internet and try again.";
+  if (code === "invalid_credentials" || msg.includes("invalid login")) return "That email and password don't match. Check them, or create an account.";
+  if (code === "user_already_exists" || msg.includes("already registered")) return "There's already an account with this email. Sign in instead.";
+  if (code === "weak_password" || msg.includes("password should")) return "Choose a stronger password: at least 8 characters.";
+  if (code === "email_not_confirmed") return "This email isn't confirmed yet. Open the confirmation email, then sign in.";
+  if (code === "over_email_send_rate_limit" || code === "over_request_rate_limit") return "Too many attempts. Wait a few minutes and try again.";
+  if (code === "email_address_not_authorized") return "Sign-up emails aren't set up for this address yet. Email confirmation needs to be switched off in Supabase.";
+  if (code === "signup_disabled") return "New accounts are switched off for now.";
+  if (code === "email_address_invalid" || msg.includes("invalid email")) return "Enter a valid email address.";
+  return "Couldn't sign in" + (e && e.message ? `: ${e.message}` : ". Try again.");
+}
+function bindAuth() {
+  const f = $("#authf"), err = $("#autherr");
+  $("#aemail").oninput = e => { S.authEmail = e.target.value; };
+  $("#app").onclick = e => {
+    const b = e.target.closest("[data-act]"); if (!b) return;
+    if (b.dataset.act === "authswitch") { S.authMode = (S.authMode || (lsGet("macro.cloud.last") ? "in" : "up")) === "up" ? "in" : "up"; S.authMsg = null; render(); }
+    if (b.dataset.act === "authskip") { lsSet("macro.nocloud", true); S.mode = "device"; Store.loadLocal(); S.ready = true; render(); }
+  };
+  f.onsubmit = async e => {
+    e.preventDefault();
+    const up = (S.authMode || (lsGet("macro.cloud.last") ? "in" : "up")) === "up";
+    const email = $("#aemail").value.trim().toLowerCase(), password = $("#apw").value;
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) { err.textContent = "Enter a valid email address."; return; }
+    if (password.length < 8) { err.textContent = up ? "Use at least 8 characters for your password." : "Enter your password."; return; }
+    const go = $("#authgo"); go.disabled = true; go.innerHTML = '<span class="spinner"></span> ' + (up ? "Creating account…" : "Signing in…"); err.textContent = "";
+    try {
+      const c = Cloud.client();
+      const { data, error } = up ? await c.auth.signUp({ email, password }) : await c.auth.signInWithPassword({ email, password });
+      if (error) throw error;
+      if (!data.session) { S.authMode = "in"; S.authMsg = `We sent a confirmation link to ${email}. Open it, then come back and sign in.`; render(); return; }
+      lsSet("macro.nocloud", false); S.ready = false; render();
+      await Cloud.start(data.user);
+      if (up) toast("Account created. Your data now saves to it.");
+    } catch (x) { go.disabled = false; go.textContent = up ? "Create account" : "Sign in"; err.textContent = authErrorText(x); }
+  };
+}
+function renderImport() {
+  const o = S.importOffer;
+  return `<div class="ob">
+    <div class="obtitle">Bring your data with you?</div>
+    <p class="sub">This phone has Macro data from before you had an account: <b class="num">${o.days} day${o.days === 1 ? "" : "s"} of meals</b> and <b class="num">${o.weights} weigh-in${o.weights === 1 ? "" : "s"}</b>, plus your targets and settings.</p>
+    <button class="btn primary block" data-act="impyes" type="button">Add it to my account</button>
+    <button class="btn ghost block" data-act="impno" type="button">Start fresh</button>
+    <p class="tiny">Starting fresh keeps the old data on this phone, so you can still add it later from a backup.</p>
+  </div>`;
+}
+function bindImport() {
+  $("#app").onclick = e => {
+    const b = e.target.closest("[data-act]"); if (!b) return;
+    if (b.dataset.act === "impyes") {
+      const legacy = lsGet("macro.v1") || {};
+      S.profile = legacy.profile || null; S.days = legacy.days || {}; S.weights = legacy.weights || {};
+      if (S.profile && !S.profile.routine) S.profile.routine = { ...DEFAULT_ROUTINE };
+      Cloud.markAll(); lsSet("macro.v1.uploaded", legacy); try { localStorage.removeItem("macro.v1"); } catch { }
+      S.importOffer = null; location.hash = "today"; render(); toast("Your data is being added to your account");
+    }
+    if (b.dataset.act === "impno") { S.importOffer = null; render(); }
+  };
+}
 
 /* =========================================================
    Day data
@@ -1211,6 +1467,14 @@ function render() {
     app.innerHTML = `<div class="splash"><div class="stack" style="align-items:center"><div class="spinner"></div><p class="sub">${S.slow ? "Your account is taking a while to answer. It will open as soon as it connects." : "Opening your account…"}</p></div></div>`;
     return;
   }
+  if (S.mode === "signin") { nav.hidden = true; app.innerHTML = renderAuth(); bindAuth(); return; }
+  if (S.mode === "cloud" && S.cloudError) {
+    nav.hidden = true;
+    app.innerHTML = `<div class="ob"><div class="obtitle">Can't reach your account</div><p class="sub">Macro couldn't load your data. Check your connection, then try again.</p><button class="btn primary block" data-act="cloudretry" type="button">Try again</button></div>`;
+    $("#app").onclick = async e => { if (!e.target.closest("[data-act=cloudretry]")) return; S.cloudError = false; S.ready = false; render(); const u = Cloud.user; Cloud.user = null; await Cloud.start(u); };
+    return;
+  }
+  if (S.mode === "cloud" && S.importOffer && !S.profile) { nav.hidden = true; app.innerHTML = renderImport(); bindImport(); return; }
   if (!S.profile || !S.profile.onboarded) { nav.hidden = true; app.innerHTML = renderOnboarding(); bindOnboarding(); return; }
   nav.hidden = false;
   const r = route(); S.lastRoute = r;
@@ -1224,8 +1488,7 @@ function render() {
 }
 const navLink = (r, label, ic, cur) => `<a href="#${r}" ${cur === r ? 'aria-current="page"' : ""}>${ic}<span>${label}</span></a>`;
 function topbar(right = "") {
-  const st = S.mode === "account" ? `<span class="pill good" title="Saved to your Claude account"><span class="dot"></span>Synced</span>` : `<span class="pill warn" title="Saved in this browser only"><span class="dot"></span>This device</span>`;
-  return `<div class="topbar"><span class="brand">Macro</span><span class="spacer"></span>${right}${st}</div>`;
+  return `<div class="topbar"><span class="brand">Macro</span><span class="spacer"></span>${right}${pillHtml()}</div>`;
 }
 function srcBadge(it) {
   if (it.source === "brand_official") return `<span class="src off">Official${it.brand ? " · " + esc(it.brand) : ""}${it.verified ? " · checked" : ""}</span>`;
@@ -2116,7 +2379,8 @@ function renderYou() {
       <p class="tiny" style="padding:0 2px">Until a device connects, enter your tracker's average daily burn under Adjust → Improve the estimate.</p>
     </div>
     <div class="section"><div class="sechead"><h2>Account & data</h2></div><div class="setlist">
-      <div class="setrow"><span class="k grow">Saved to</span><span class="v">${S.mode === "account" ? "Your Claude account (private to you)" : STANDALONE ? "This phone only" : "This browser only"}</span></div>
+      <div class="setrow"><span class="k grow">Saved to</span><span class="v">${S.mode === "cloud" ? `Your account · ${esc(Cloud.user?.email || "")}` : S.mode === "account" ? "Your Claude account (private to you)" : STANDALONE ? "This phone only" : "This browser only"}</span></div>
+      ${S.mode === "cloud" ? row("signout", "Sign out", Cloud.hasDirty() ? `${Cloud.dirtyCount()} change${Cloud.dirtyCount() > 1 ? "s" : ""} not synced yet` : "") : STANDALONE && Cloud.available() ? row("signin", "Create account or sign in", "Sync to your account") : ""}
       ${STANDALONE ? `<button class="setrow" data-edit="backup"><span class="k">Back up data</span><span class="v">Save a file</span><span class="chev">${ICON.chev}</span></button>
       <label class="setrow" for="restorein" style="cursor:pointer"><span class="k">Restore from backup</span><span class="v">Choose file</span><span class="chev">${ICON.chev}</span><input id="restorein" type="file" accept="application/json,.json" hidden></label>` : ""}
       ${STANDALONE ? row("ai", "AI analysis", apiKey() ? `On · key …${esc(apiKey().slice(-4))}` : "Off · add API key") : ""}
@@ -2142,7 +2406,8 @@ async function restoreData(file) {
   try {
     const d = JSON.parse(await file.text());
     if (d.app !== "macro" || !d.profile || typeof d.days !== "object" || typeof d.weights !== "object") throw 0;
-    S.profile = d.profile; S.days = d.days; S.weights = d.weights; Store.saveLocal();
+    S.profile = d.profile; S.days = d.days; S.weights = d.weights;
+    if (S.mode === "cloud") Cloud.markAll(); else Store.saveLocal();
     render(); toast(`Restored ${Object.keys(d.days).length} days and ${Object.keys(d.weights).length} weigh-ins`);
   } catch { toast("That file isn't a Macro backup."); }
 }
@@ -2174,6 +2439,17 @@ function openEdit(which) {
   const save = async (msg) => { await Store.saveProfile(); closeSheet(); render(); toast(msg || "Saved"); };
   if (which === "meals") return openMealsSheet();
   if (which === "backup") return backupData();
+  if (which === "signin") { try { localStorage.removeItem("macro.nocloud"); } catch { } S.mode = "signin"; S.authMode = "up"; S.authMsg = "After you sign in, Macro offers to add this phone's data to your account."; render(); return; }
+  if (which === "signout") {
+    const n = Cloud.dirtyCount();
+    openSheet(`<h2>Sign out?</h2><p class="sub">Your data stays in your account. This phone forgets it until you sign in again.</p>
+      ${n ? `<div class="banner warn"><div><b>${n} change${n > 1 ? "s haven't" : " hasn't"} reached your account yet.</b> Connect to the internet and wait for “Synced” first, or they'll be lost.</div></div>` : ""}
+      <div class="row"><button class="btn ghost grow" data-a="no" type="button">Cancel</button><button class="btn ${n ? "danger" : "primary"} grow" data-a="yes" type="button">${n ? "Sign out anyway" : "Sign out"}</button></div>`, sh => {
+      sh.querySelector('[data-a="no"]').onclick = closeSheet;
+      sh.querySelector('[data-a="yes"]').onclick = async () => { await Cloud.signOut(); closeSheet(); location.hash = "today"; render(); toast("Signed out"); };
+    });
+    return;
+  }
   if (which === "ai") {
     const has = !!apiKey();
     openSheet(`<h2>AI analysis</h2>
@@ -2249,13 +2525,13 @@ function openEdit(which) {
       <p class="tiny">With a device connected, Macro would use yesterday's measured burn, smoothed over 7 days, instead of the single activity multiplier.</p>`);
   }
   if (which === "wipe") {
-    openSheet(`<h2>Delete all data?</h2><p>This removes your profile, ${Object.keys(S.days).length} days of meals and ${Object.keys(S.weights).length} weigh-ins${S.mode === "account" ? " from your account" : " from this browser"}. It can't be undone.</p>
+    openSheet(`<h2>Delete all data?</h2><p>This removes your profile, ${Object.keys(S.days).length} days of meals and ${Object.keys(S.weights).length} weigh-ins${S.mode === "account" || S.mode === "cloud" ? " from your account" : " from this browser"}. It can't be undone.</p>
       <div class="field"><label for="wipeok">Type DELETE to confirm</label><input id="wipeok" class="input" autocomplete="off"></div>
       <div class="row"><button class="btn ghost grow" data-a="no">Cancel</button><button class="btn danger grow" data-a="yes" disabled>Delete everything</button></div>`, sh => {
       const inp = sh.querySelector("#wipeok"), yes = sh.querySelector('[data-a="yes"]');
       inp.oninput = () => yes.disabled = inp.value.trim().toUpperCase() !== "DELETE";
       sh.querySelector('[data-a="no"]').onclick = closeSheet;
-      yes.onclick = async () => { yes.disabled = true; yes.textContent = "Deleting…"; await Store.wipe(); S.ob = null; closeSheet(); location.hash = "today"; render(); toast("All data deleted"); };
+      yes.onclick = async () => { yes.disabled = true; yes.textContent = "Deleting…"; if (!(await Store.wipe())) { closeSheet(); return; } S.ob = null; closeSheet(); location.hash = "today"; render(); toast("All data deleted"); };
     });
   }
 }
@@ -2376,7 +2652,7 @@ function renderOnboarding() {
       <button class="choice" type="button" data-v="calc" aria-pressed="${d.targetMode !== "own"}"><span class="mark"></span><span><span class="t">Calculate them for me</span><br><span class="d">From your body, activity and goal. Adapts as your weight moves.</span></span></button>
       <button class="choice" type="button" data-v="own" aria-pressed="${d.targetMode === "own"}"><span class="mark"></span><span><span class="t">I have my own targets</span><br><span class="d">From a coach, another app or your own plan. Macro just tracks.</span></span></button></div></div>
     <div class="field"><span class="lab">Units</span><div class="seg" data-units><button type="button" data-u="metric" aria-pressed="${u !== "us"}">Metric · kg, cm</button><button type="button" data-u="us" aria-pressed="${u === "us"}">US · lb, ft/in</button></div></div>
-    <p class="tiny">${S.mode === "account" ? "Everything saves privately to your Claude account." : STANDALONE ? "Everything saves on this phone. Use Back up data under You to keep a copy." : "This view can't reach your account, so everything saves in this browser."}</p>`;
+    <p class="tiny">${S.mode === "cloud" ? `Everything saves to your account (${esc(Cloud.user?.email || "")}).` : S.mode === "account" ? "Everything saves privately to your Claude account." : STANDALONE ? "Everything saves on this phone. Use Back up data under You to keep a copy." : "This view can't reach your account, so everything saves in this browser."}</p>`;
   if (id === "body") body = `<div class="obtitle">Your body</div><p class="sub">${d.targetMode === "own" ? "Used for BMI and your weight trend." : "Used to estimate how much energy you burn."}</p>
     <div class="field"><span class="lab">Sex for energy equations</span><div class="seg" data-sex><button type="button" data-s="male" aria-pressed="${d.sex === "male"}">Male</button><button type="button" data-s="female" aria-pressed="${d.sex === "female"}">Female</button></div><div class="ferr" data-err="sex"></div></div>
     <div class="field"><label for="age">Age</label><div class="withunit"><input id="age" class="input" inputmode="numeric" value="${d.age ?? ""}"><span class="u">years</span></div><div class="ferr" data-err="age"></div></div>
