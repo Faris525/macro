@@ -15,7 +15,7 @@ An adaptive calorie and macro tracker for bulking, cutting and maintaining, buil
 It's a single static page: `index.html` plus the manifest and icons. No build step.
 
 - **Local:** `python3 -m http.server` in this folder, then open http://localhost:8000.
-- **Deploy:** Netlify serves the repository root (see `netlify.toml`). Every push to `main` publishes.
+- **Deploy:** Netlify serves the repository root (see `netlify.toml`). Every push to `main` publishes. The repository is public so Netlify's free plan can publish every change.
 - **iPhone:** open the site in Safari → Share → Add to Home Screen. Set up the app from the home-screen icon, not Safari.
 
 ## Where data lives
